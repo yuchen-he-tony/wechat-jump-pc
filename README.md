@@ -55,7 +55,7 @@ pip install -r requirements.txt
 | `bg_diff_threshold` | 方块与背景色差阈值 |
 | `press_noise_ratio` | 按压时长随机抖动比例（防检测） |
 | `jump_wait_seconds` | 每跳后等待动画的时间区间 |
-| `max_score_stop` | 跳跃步数上限，达到后主动停止（防封） |
+| `max_score_stop` | 跳跃步数上限，达到后主动停止 |
 | `debug_save_screenshots` | 是否保存每跳标记图到 `debug/` |
 
 ## 常见问题
@@ -75,3 +75,40 @@ pip install -r requirements.txt
 - 算法思路：[wangshub/wechat_jump_game](https://github.com/wangshub/wechat_jump_game)
 - PC 端参考：[B5DX/pc_wechat_jump_auto](https://github.com/B5DX/pc_wechat_jump_auto)、
   [XDDXMT/AutoJump](https://github.com/XDDXMT/AutoJump)
+
+
+## 落地验证、按压补偿和间隔控制
+
+程序会在每跳后等待棋子及画面稳定，并跟踪目标平台随镜头移动后的位置，测量落点偏差。模板匹配只在落地棋子附近搜索；小平台会额外保留下方瓶身/底座特征，减少棋子遮挡瓶盖或相似白色平台导致的误停。无法确认落地、窗口移位/失焦、结算页或异常偏差时停止，不继续使用旧坐标点击。
+
+按压时间支持 `距离 × press_coefficient + press_offset_ms`。默认固定补偿为 0，保留原来的系数口径；`config.windows-608.json` 是在 608×1085 物理像素游戏区域上实测得到的示例，并非通用参数。可先运行：
+
+```bash
+python main.py --snap
+python main.py --once
+python main.py --config config.windows-608.json --once
+```
+
+新增/更新的配置：
+
+| 字段 | 作用 |
+|---|---|
+| `landing_to_takeoff_seconds` | `[3.5, 5.0]` 表示每跳独立抽取间隔；也接受单个正数作为固定间隔。蓄力包含在间隔内。 |
+| `press_offset_ms` | 固定按压补偿，单位毫秒，默认 0。 |
+| `press_model` | `affine` 使用带固定补偿的模型；在线更新只小幅调整补偿，保留批量拟合系数。 |
+| `auto_calibrate` | 是否把高置信度落点用于更新配置，默认关闭；示例配置开启。 |
+| `max_press_ms` | 异常按压时长上限，默认 1800 毫秒。 |
+| `max_score_stop` | 每次运行的跳跃步数上限，默认 300；该字段不是实际游戏分数。 |
+
+落地时间根据连续截图的稳定状态估计，不是读取游戏内部物理事件。间隔随机化不保证避免游戏检测。首跳仍使用 3 秒准备时间。
+
+诊断图片按运行时间保存到 `debug/` 子目录，避免后续对局覆盖；`calibration.jsonl` 记录实际按压时长、计划/实际间隔、坐标及原图路径。`--snap` 即使关闭常规调试图片，也会保存一张标记图。在线校准只接受低模板误差、横向偏差较小的观测，异常记录不会更新参数。
+
+### 离线验证
+
+```bash
+python test_offline.py
+python -m unittest -v test_calibration
+```
+
+合成场景覆盖相似平台误匹配和棋子遮住小瓶盖；时序测试使用模拟时钟/鼠标，不会操作桌面。新增测试不需要用户截图或对局日志。示例补偿参数不代表跨设备准确率。

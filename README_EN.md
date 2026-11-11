@@ -95,3 +95,36 @@ in ±0.02 steps).
 ## License
 
 MIT
+
+
+## Landing verification, timing and calibration
+
+Each jump now waits for the scene and piece to settle, then follows the destination platform through camera motion to measure landing error. Matching is constrained to the landed piece's neighborhood. Small platforms retain visible body/base features below their top, which prevents a piece covering a small bottle cap from causing a false stop. Uncertain landing, settlement screens, lost focus, moved windows and abnormal error stop the loop instead of reusing stale coordinates.
+
+Charging time supports `distance * press_coefficient + press_offset_ms`. The default offset is zero, retaining the existing coefficient scale. `config.windows-608.json` is an example calibrated for a 608x1085 physical-pixel game region; its values are not universal. Start with preview and one-step mode:
+
+```bash
+python main.py --snap
+python main.py --once
+python main.py --config config.windows-608.json --once
+```
+
+- `landing_to_takeoff_seconds`: a range such as `[3.5, 5.0]`, sampled independently each jump, or a positive scalar for a fixed interval. Charging time is included in that interval.
+- `press_offset_ms`: additive charging compensation, in milliseconds; defaults to zero.
+- `press_model`: `affine` keeps the fitted slope stable during online calibration and makes small offset corrections.
+- `auto_calibrate`: accepts reliable landing observations to update the configuration; disabled by default and enabled in the example profile.
+- `max_press_ms`: rejects abnormal charging durations; defaults to 1800 ms.
+- `max_score_stop`: limits jumps per run, not the actual game score; defaults to 300.
+
+Landing is inferred from stable screenshots, not an internal game physics event. Random intervals do not guarantee avoidance of game detection. The first jump still has a three-second preparation delay. Missed charging deadlines are rejected without clicking.
+
+Diagnostic images are stored in per-run directories under `debug/`. `calibration.jsonl` records measured charging times, planned/actual intervals, positions and image paths. `--snap` saves an annotated frame even when routine debug images are disabled. Uncertain observations do not update calibration.
+
+### Offline validation
+
+```bash
+python test_offline.py
+python -m unittest -v test_calibration
+```
+
+Synthetic scenes cover similar platforms and an occluded small bottle cap. Timing/cleanup tests use a fake clock and mouse and do not interact with the desktop. The new tests require no user screenshots or gameplay logs. The example calibration does not establish accuracy on other devices.

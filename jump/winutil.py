@@ -37,6 +37,8 @@ class GameRegion:
     top: int
     width: int
     height: int
+    hwnd: int | None = None
+    client_top: int | None = None
 
     def to_mss(self) -> dict:
         return {"left": self.left, "top": self.top,
@@ -69,11 +71,11 @@ def game_region_from_window(win, title_bar_height: int) -> GameRegion:
             _, _, cw, ch = win32gui.GetClientRect(hwnd)
             if cw > 200 and ch > 300:
                 return GameRegion(left, top + title_bar_height,
-                                  cw, ch - title_bar_height)
+                                  cw, ch - title_bar_height, hwnd, top)
         except Exception:
             pass
     return GameRegion(win.left, win.top + title_bar_height,
-                      win.width, win.height - title_bar_height)
+                      win.width, win.height - title_bar_height, hwnd)
 
 
 def locate_game_region(title_keywords: list[str],

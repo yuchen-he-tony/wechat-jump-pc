@@ -22,7 +22,7 @@ import time
 import cv2
 import pyautogui
 
-from jump import control, vision, winutil
+from jump import calibration, control, vision, winutil
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,13 +63,15 @@ def main() -> int:
     print(f"[*] 游戏区域: left={region.left} top={region.top} "
           f"{region.width}x{region.height}")
 
-    debug_dir = os.path.join(BASE_DIR, cfg.get("debug_dir", "debug"))
-    if cfg.get("debug_save_screenshots"):
-        os.makedirs(debug_dir, exist_ok=True)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    debug_dir = os.path.join(BASE_DIR, cfg.get("debug_dir", "debug"), run_id)
+    os.makedirs(debug_dir, exist_ok=True)
 
     capturer = vision.ScreenCapturer()
     fails = 0
     jumps = 0
+    last_landed_at = None
+    log_path = os.path.join(BASE_DIR, "calibration.jsonl")
 
     print("[*] 3 秒后开始，请切换到游戏窗口……（Ctrl+C 停止）")
     time.sleep(3)
@@ -77,8 +79,16 @@ def main() -> int:
     while True:
         cfg = load_config(args.config)  # 每跳前重读配置，边跑边调不重启
         region = winutil.locate_game_region(cfg["window_title_keywords"],
-                                            cfg["title_bar_height"]) or region
+                                            cfg["title_bar_height"])
+        if region is None:
+            print("[!] 游戏窗口已关闭，停止运行。")
+            return 1
         frame = capturer.grab_bgr(region)
+        if not vision.is_playing_frame(frame):
+            os.makedirs(debug_dir, exist_ok=True)
+            save_image(frame, os.path.join(debug_dir, 'not_in_game.png'))
+            print("[!] 未确认左上角对局分数：可能为结算页、遮挡或加载页；不执行点击。")
+            return 1
         res = vision.detect(frame, cfg)
 
         if res is None:
@@ -94,27 +104,121 @@ def main() -> int:
 
         if cfg.get("debug_save_screenshots"):
             path = os.path.join(debug_dir, f"jump_{jumps:04d}.png")
+            save_image(frame, os.path.join(debug_dir, f"jump_{jumps:04d}_raw.png"))
             if not save_image(vision.annotate(frame, res), path):
                 print(f"[!] 调试图保存失败: {path}")
 
         if args.snap:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_image(vision.annotate(frame, res),
+                       os.path.join(debug_dir, f"jump_{jumps:04d}.png"))
             print(f"[*] 已保存标记图到 {debug_dir}\\jump_{jumps:04d}.png，"
                   "未执行跳跃。")
             break
 
         angles = cfg.get("jump_axis_angles_deg")
         dist = res.axis_distance(angles) if angles else res.distance
-        duration = control.jump(region, dist, cfg)
+        tracker = calibration.BoardTracker.create(frame, res, cfg)
+        planned_interval = (control.sample_landing_interval(cfg)
+                            if last_landed_at is not None else None)
+        release_at = (last_landed_at + planned_interval
+                      if planned_interval is not None else None)
+        if planned_interval is not None:
+            print(f"[*] 本跳落稳至起跳计划间隔：{planned_interval:.3f}s")
+        duration = control.jump(region, dist, cfg, release_at=release_at)
+        released_at = time.monotonic()
         jumps += 1
         print(f"[+] 第 {jumps} 跳: 轴向距离 {dist:.1f}px"
               f"（欧氏 {res.distance:.1f}）→ 按压 {duration:.0f}ms")
 
+        settled = calibration.wait_for_landing(capturer, region, cfg, released_at)
+        if settled is None:
+            print("[!] 无法确认棋子落稳，已停止。")
+            break
+        landing_frame, landed_piece, landed_at = settled
+        if not vision.is_playing_frame(landing_frame):
+            save_image(landing_frame, os.path.join(debug_dir, f'not_in_game_{run_id}.png'))
+            print("[!] 落地后未确认对局画面，已停止；不更新校准。")
+            break
+        interval = (released_at-last_landed_at
+                    if last_landed_at is not None else None)
+        last_landed_at = landed_at
+        measured_center = tracker.locate(landing_frame, near_piece=landed_piece) if tracker else None
+        record = dict(run=run_id, step=jumps, distance=round(dist, 2),
+                      duration_ms=round(duration, 2),
+                      coefficient=cfg['press_coefficient'],
+                      press_offset_ms=cfg.get('press_offset_ms', 0.0),
+                      planned_interval_seconds=round(planned_interval, 3) if planned_interval else None,
+                      landing_to_takeoff_seconds=round(interval, 3) if interval else None)
+        record.update(piece_before=[res.piece_x, res.piece_y],
+                      target_before=[res.board_x, res.board_y],
+                      landed_piece=list(map(int, landed_piece)))
+        if cfg.get('debug_save_screenshots'):
+            raw_landing = os.path.join(debug_dir, f'landing_{jumps:04d}_raw.png')
+            save_image(landing_frame, raw_landing)
+            record['landing_image'] = os.path.relpath(raw_landing, BASE_DIR)
+            record['before_image'] = os.path.relpath(
+                os.path.join(debug_dir, f'jump_{jumps-1:04d}_raw.png'), BASE_DIR)
+        if measured_center is not None:
+            center = measured_center[:2]
+            record['tracked_center'] = list(map(int, center))
+            signed, norm = calibration.signed_error(res, landed_piece, center)
+            record.update(error_along_px=round(signed, 2),
+                          error_total_px=round(norm, 2),
+                          template_loss=round(measured_center[2], 4))
+            if norm > 65:
+                record['valid'] = False
+                record['reason'] = 'landing outside platform center tolerance'
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(record, ensure_ascii=False)+'\n')
+                save_image(landing_frame, os.path.join(debug_dir, f'uncertain_{run_id}.png'))
+                print(f"[!] 落点偏差 {norm:.1f}px，无法确认本次成功，已停止；不更新校准。")
+                break
+            record['valid'] = True
+            label = "偏远" if signed > 0 else "偏近"
+            print(f"[校准] {label} {abs(signed):.1f}px，中心偏差 {norm:.1f}px"
+                  + (f"，落地至起跳 {interval:.2f}s" if interval else ""))
+            landed_res = vision.DetectResult(*landed_piece, *center)
+            if cfg.get('debug_save_screenshots'):
+                save_image(vision.annotate(landing_frame, landed_res),
+                           os.path.join(debug_dir, f"landing_{run_id}_{jumps:02d}.png"))
+            lateral = max(0.0, norm*norm-signed*signed) ** 0.5
+            if (cfg.get('auto_calibrate', False) and measured_center[2] < 0.07
+                    and norm < dist*0.25 and lateral < 20
+                    and dist+signed > 80):
+                if cfg.get('press_model') == 'affine':
+                    # Keep the batch-fitted slope stable; only make small
+                    # latency corrections from reliable landing observations.
+                    current = cfg.get('press_offset_ms', 0.0)
+                    estimate = duration-cfg['press_coefficient']*(dist+signed)
+                    estimate = max(current-10, min(current+10, estimate))
+                    cfg['press_offset_ms'] = round(
+                        max(-20, min(100, current*0.85+estimate*0.15)), 4)
+                    record['next_offset_ms'] = cfg['press_offset_ms']
+                else:
+                    estimate = duration/(dist+signed)
+                    estimate = max(cfg['press_coefficient']*0.90,
+                                   min(cfg['press_coefficient']*1.10, estimate))
+                    cfg['press_coefficient'] = round(
+                        cfg['press_coefficient']*0.65+estimate*0.35, 5)
+                    record['next_coefficient'] = cfg['press_coefficient']
+                with open(args.config, 'w', encoding='utf-8') as f:
+                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+        else:
+            record['valid'] = False
+            record['reason'] = 'landing platform tracking is uncertain'
+            save_image(landing_frame, os.path.join(debug_dir, f'uncertain_{run_id}.png'))
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False)+'\n')
+            print("[!] 未可靠跟踪到棋子附近的落地平台，已停止；不更新校准。")
+            break
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False)+'\n')
         if args.once:
             break
         if jumps >= cfg.get("max_score_stop", 10 ** 9):
-            print(f"[*] 达到设定的 {jumps} 步上限，主动停止（防封）。")
+            print(f"[*] 达到设定的 {jumps} 步上限，主动停止。")
             break
-        control.wait_after_jump(cfg)
 
     print("[*] 结束。")
     return 0

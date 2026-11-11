@@ -487,6 +487,18 @@ def detect(bgr: np.ndarray, cfg: dict) -> DetectResult | None:
     return DetectResult(piece[0], piece[1], board[0], board[1])
 
 
+def is_playing_frame(bgr: np.ndarray) -> bool:
+    """Require the dark score glyph at top left; settlement screens lack it."""
+    h, w = bgr.shape[:2]
+    roi = bgr[int(h*0.055):int(h*0.18), int(w*0.07):int(w*0.23)]
+    if roi.size == 0:
+        return False
+    gray = roi.mean(axis=2)
+    dark = (gray < np.median(gray)-45) & (gray < 130)
+    ys, xs = np.nonzero(dark)
+    return (len(ys) >= 60 and np.ptp(ys) >= 15 and np.ptp(xs) >= 4)
+
+
 def annotate(bgr: np.ndarray, res: DetectResult) -> np.ndarray:
     """画标记的调试图（BGR）。"""
     import cv2
